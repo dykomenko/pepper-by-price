@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pepper.ru — актуальная цена в Беларуси
 // @namespace    local.pepper.by-price
-// @version      2.0.1
+// @version      2.1.0
 // @description  Показывает актуальную цену Ozon и Wildberries в российских рублях прямо на Pepper.ru
 // @author       Codex
 // @homepageURL  https://github.com/dykomenko/pepper-by-price
@@ -250,16 +250,21 @@
 
     let result = null;
     let failure = '';
+    let antibot = false;
 
     if (!viaTab) {
       try {
         result = await checkInBackground({ dealId, store });
       } catch (error) {
         failure = error?.message || String(error);
+        antibot = Boolean(error?.antibot);
       }
     }
 
-    if (!result && (viaTab || GM_getValue(TAB_FALLBACK_KEY, false))) {
+    // Антибот магазина пропускает только настоящую страницу, поэтому вкладка
+    // открывается сама: заодно она обновляет токен, после чего фоновые
+    // запросы обычно снова проходят без вкладки.
+    if (!result && (viaTab || antibot || GM_getValue(TAB_FALLBACK_KEY, false))) {
       result = await checkViaTab({ dealId, store });
     }
 
@@ -445,6 +450,9 @@
     if (response.status === 404) {
       return outOfStockResult('товара нет на Ozon.by');
     }
+    if (response.status === 403 || response.status === 429 || response.status === 498) {
+      throw antibotError(`Ozon просит проверку браузера (HTTP ${response.status})`);
+    }
     if (response.status !== 200) {
       throw new Error(`Ozon вернул HTTP ${response.status}`);
     }
@@ -453,7 +461,7 @@
     try {
       payload = JSON.parse(response.responseText);
     } catch (_) {
-      throw new Error('Ozon прислал проверку браузера вместо цены');
+      throw antibotError('Ozon прислал проверку браузера вместо цены');
     }
 
     const states = payload?.widgetStates || {};
@@ -505,6 +513,9 @@
       throw new Error(`Wildberries не ответил: ${error.message}`);
     }
 
+    if (response.status === 498 || response.status === 403 || response.status === 429) {
+      throw antibotError(`Wildberries просит проверку браузера (HTTP ${response.status})`);
+    }
     if (response.status !== 200) {
       throw new Error(`Wildberries вернул HTTP ${response.status}`);
     }
@@ -513,10 +524,14 @@
     try {
       payload = JSON.parse(response.responseText);
     } catch (_) {
-      throw new Error('Wildberries прислал проверку браузера вместо цены');
+      throw antibotError('Wildberries прислал проверку браузера вместо цены');
     }
 
     return parseWildberriesPayload(payload, Number(product.id), apiUrl, 'BYN');
+  }
+
+  function antibotError(message) {
+    return Object.assign(new Error(message), { antibot: true });
   }
 
   function outOfStockResult(note) {
