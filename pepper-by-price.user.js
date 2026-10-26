@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pepper.ru — актуальная цена в Беларуси
 // @namespace    local.pepper.by-price
-// @version      2.0.0
+// @version      2.0.1
 // @description  Показывает актуальную цену Ozon и Wildberries в российских рублях прямо на Pepper.ru
 // @author       Codex
 // @homepageURL  https://github.com/dykomenko/pepper-by-price
@@ -292,7 +292,7 @@
   // ───────────────── Фоновая проверка (без вкладок) ─────────────────
 
   async function checkInBackground({ dealId, store }) {
-    const product = await resolveProduct(dealId, store);
+    const product = await resolveProduct(dealId);
 
     let result;
     if (product.store === 'ozon') {
@@ -310,26 +310,61 @@
     return result;
   }
 
-  async function resolveProduct(dealId, store) {
-    const visitUrl = findVisitUrl(dealId);
-    let response;
+  // Идём по цепочке редиректов вручную и останавливаемся, как только в
+  // Location появился адрес товара: сам магазин при этом не запрашивается,
+  // поэтому его недоступность или антибот на этом шаге не мешают.
+  async function resolveProduct(dealId) {
+    const headers = { Accept: 'text/html' };
+    let current = findVisitUrl(dealId);
+    let lastError = null;
+
+    for (let hop = 0; hop < 8; hop += 1) {
+      let response;
+      try {
+        response = await gmRequest(current, { headers, redirect: 'manual' });
+        lastError = null;
+      } catch (_) {
+        // Не все менеджеры скриптов умеют redirect: 'manual' — пробуем обычный режим.
+        try {
+          response = await gmRequest(current, { headers });
+          lastError = null;
+        } catch (error) {
+          lastError = error;
+          break;
+        }
+      }
+
+      const location = readLocation(response, current);
+      const candidates = [response.finalUrl, location].filter(Boolean);
+
+      // Короткие страницы-заглушки трекеров редиректят через meta/JS.
+      const body = String(response.responseText || '');
+      if (response.status === 200 && body.length < 5000) candidates.push(body);
+
+      for (const value of candidates) {
+        const product = parseProductUrl(value) || parseProductUrl(safeDecode(value));
+        if (product) return product;
+      }
+
+      if (!location || location === current) break;
+      current = location;
+    }
+
+    throw new Error(
+      lastError
+        ? `Не удалось перейти по ссылке скидки: ${lastError.message}`
+        : 'Не удалось определить товар по ссылке скидки'
+    );
+  }
+
+  function readLocation(response, baseUrl) {
+    const raw = String(response?.responseHeaders || '').match(/^location:\s*(.+)$/im)?.[1]?.trim();
+    if (!raw) return null;
     try {
-      response = await gmRequest(visitUrl, { headers: { Accept: 'text/html' } });
-    } catch (error) {
-      throw new Error(`Не удалось перейти по ссылке скидки: ${error.message}`);
+      return new URL(raw, baseUrl).href;
+    } catch (_) {
+      return null;
     }
-
-    const candidates = [
-      response.finalUrl,
-      response.responseHeaders?.match(/^location:\s*(.+)$/im)?.[1],
-    ].filter(Boolean);
-
-    for (const value of candidates) {
-      const product = parseProductUrl(value) || parseProductUrl(safeDecode(value));
-      if (product) return product;
-    }
-
-    throw new Error('Не удалось определить товар по ссылке скидки');
   }
 
   function parseProductUrl(value) {
@@ -496,6 +531,14 @@
   }
 
   function gmRequest(url, options = {}) {
+    const where = (() => {
+      try {
+        return new URL(url).hostname;
+      } catch (_) {
+        return url;
+      }
+    })();
+
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
@@ -503,10 +546,13 @@
         headers: options.headers,
         timeout: options.timeout || REQUEST_TIMEOUT,
         anonymous: false,
+        ...(options.redirect ? { redirect: options.redirect } : {}),
         onload: resolve,
-        onerror: () => reject(new Error('сеть недоступна')),
-        ontimeout: () => reject(new Error('превышено время ожидания')),
-        onabort: () => reject(new Error('запрос прерван')),
+        onerror: (response) => reject(new Error(
+          `сеть недоступна (${where}${response?.error ? `: ${response.error}` : ''})`
+        )),
+        ontimeout: () => reject(new Error(`превышено время ожидания (${where})`)),
+        onabort: () => reject(new Error(`запрос прерван (${where})`)),
       });
     });
   }
