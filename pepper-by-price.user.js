@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pepper.ru — актуальная цена в Беларуси
 // @namespace    local.pepper.by-price
-// @version      2.1.0
+// @version      2.1.1
 // @description  Показывает актуальную цену Ozon и Wildberries в российских рублях прямо на Pepper.ru
 // @author       Codex
 // @homepageURL  https://github.com/dykomenko/pepper-by-price
@@ -49,7 +49,8 @@
   const PRICE_RE =
     /(\d[\d ]*(?:[,.]\d{1,2})?)\s*(BYN|Br|бел\.?\s*руб\.?|р\.|₽|RUB|рос\.?\s*руб\.?|руб\.?)(?![\p{L}\p{N}])/iu;
   const OUT_OF_STOCK_RE =
-    /нет в наличии|товар закончился|распродан|сообщить о поступлении|узнать о поступлении|доставка недоступна|временно недоступен/i;
+    // На WB между словами стоит неразрывный пробел, поэтому везде \s, а не " ".
+    /нет\s+в\s+наличии|товар\s+закончился|распродан|(?:сообщить|узнать)\s+о\s+поступлении|доставка\s+недоступна|не\s+доставля|временно\s+недоступен/i;
   const autoStartedDeals = new Set();
   let wbApiLastAttemptAt = 0;
   let wbApiLastError = '';
@@ -701,10 +702,12 @@
 
     wrap.classList.add(result.available === false ? 'pby-warn' : 'pby-ok');
 
-    const noPrice = !result.price;
+    // Недоступный товар (закончился или не доставляют в РБ) цены не показывает:
+    // купить по ней всё равно нельзя. Последняя цена остаётся в подсказке.
+    const noPrice = !result.price || result.available === false;
     const price = document.createElement(result.url && !noPrice ? 'a' : 'span');
     price.className = 'pby-price';
-    price.textContent = noPrice ? '🇧🇾 Нет в наличии' : `🇧🇾 ${result.price}`;
+    price.textContent = noPrice ? '🇧🇾 Нет в наличии / не доставляют в РБ' : `🇧🇾 ${result.price}`;
     if (result.url && !noPrice) {
       price.href = result.url;
       price.target = '_blank';
@@ -715,7 +718,6 @@
 
     const metaParts = [];
     if (result.note) metaParts.push(result.note);
-    if (result.available === false && !noPrice) metaParts.push('нет доставки / закончился');
     if (result.checkedAt) {
       metaParts.push(new Date(result.checkedAt).toLocaleTimeString('ru-RU', {
         hour: '2-digit',
@@ -730,7 +732,10 @@
       wrap.append(meta);
     }
 
-    wrap.title = result.sourceText || '';
+    wrap.title = [
+      result.price && result.available === false ? `Последняя цена: ${result.price}` : '',
+      result.sourceText || '',
+    ].filter(Boolean).join('\n');
   }
 
   function isFreshResult(result) {
@@ -905,11 +910,19 @@
       };
     }
 
+    // Ищем цену только в блоке самого товара: в «Похожих» и каруселях тоже
+    // есть цены, и для распроданного товара они попадали в ответ.
+    const productRoot =
+      document.querySelector('.product-page-wrapper, .product-page, [class*="productPage"]') ||
+      document.querySelector('main') ||
+      document.body;
+    const productText = productRoot.innerText || '';
+
     const walletRoot = firstVisible([
       '[class*="wallet-price"]',
       '[class*="walletPrice"]',
       '[data-testid*="wallet"][data-testid*="price"]',
-    ]);
+    ], productRoot);
     if (walletRoot) {
       const walletPrices = collectPriceCandidates(walletRoot);
       if (walletPrices.length) {
@@ -921,7 +934,7 @@
           valueByn: selected.currency === 'BYN' ? selected.value : null,
           valueRub: selected.currency === 'RUB' ? selected.value : null,
           sourceText: walletRoot.innerText,
-          available: !OUT_OF_STOCK_RE.test(pageText),
+          available: !OUT_OF_STOCK_RE.test(productText),
           note: 'с WB Кошельком',
         };
       }
@@ -934,7 +947,7 @@
       '.price-block__final-price',
       '[class*="price-block"]',
       '[class*="priceBlock"]',
-    ]);
+    ], productRoot);
 
     if (priceRoot) {
       const prices = collectPriceCandidates(priceRoot);
@@ -947,27 +960,26 @@
           valueByn: selected.currency === 'BYN' ? selected.value : null,
           valueRub: selected.currency === 'RUB' ? selected.value : null,
           sourceText: priceRoot.innerText,
-          available: !OUT_OF_STOCK_RE.test(pageText),
+          available: !OUT_OF_STOCK_RE.test(productText),
           note: null,
         };
       }
     }
 
-    // Нет цены, но в блоке товара есть признаки «нет в наличии». Требуем два
-    // совпадения подряд, чтобы не принять за них ещё не догрузившуюся страницу.
-    const productArea =
-      document.querySelector('.product-page, [class*="productPage"], [class*="product-page"], main');
-    if (productArea && OUT_OF_STOCK_RE.test((productArea.innerText || '').slice(0, 4000))) {
+    // Цены в блоке товара нет, но есть признаки «нет в наличии». Требуем два
+    // совпадения подряд, чтобы не принять за них ещё не догрузившуюся страницу,
+    // и в любом случае не подставляем «первую попавшуюся» цену со страницы.
+    const soldOutBlock = firstVisible(['[class*="soldOut"]'], productRoot);
+    if (soldOutBlock) return outOfStockResult('нет в наличии на Wildberries.by');
+
+    if (OUT_OF_STOCK_RE.test(productText)) {
       outOfStockHits += 1;
       if (outOfStockHits >= 2) return outOfStockResult('нет в наличии на Wildberries.by');
-    } else {
-      outOfStockHits = 0;
+      return { ok: false, message: 'Wildberries сообщает, что товара нет в наличии' };
     }
+    outOfStockHits = 0;
 
-    const genericPrices = collectPriceCandidates(
-      document.querySelector('main') || document.body,
-      { generic: true }
-    );
+    const genericPrices = collectPriceCandidates(productRoot, { generic: true, skipCards: true });
     if (genericPrices.length) {
       const selected = genericPrices.find((item) => item.currency === 'RUB') || genericPrices[0];
       return {
@@ -977,7 +989,7 @@
         valueByn: selected.currency === 'BYN' ? selected.value : null,
         valueRub: selected.currency === 'RUB' ? selected.value : null,
         sourceText: genericPrices.slice(0, 3).map((item) => item.text).join(' | '),
-        available: !OUT_OF_STOCK_RE.test(pageText),
+        available: !OUT_OF_STOCK_RE.test(productText),
         note: null,
       };
     }
@@ -1216,6 +1228,7 @@
     for (const element of all) {
       if (!(element instanceof HTMLElement) || !isVisible(element)) continue;
       if (element.children.length > 2) continue;
+      if (options.skipCards && element.closest(CARD_LIST_SELECTOR)) continue;
 
       const text = String(element.innerText || element.textContent || '')
         .replace(/[    ]/g, ' ')
@@ -1336,10 +1349,19 @@
 
   // ───────────────────── DOM-утилиты ─────────────────────
 
-  function firstVisible(selectors) {
+  const CARD_LIST_SELECTOR =
+    'article, [class*="slider"], [class*="swiper"], [class*="similar"], [class*="carousel"]';
+
+  function firstVisible(selectors, root = document) {
     for (const selector of selectors) {
-      for (const element of document.querySelectorAll(selector)) {
-        if (element instanceof HTMLElement && isVisible(element)) return element;
+      for (const element of root.querySelectorAll(selector)) {
+        if (
+          element instanceof HTMLElement &&
+          isVisible(element) &&
+          !element.closest(CARD_LIST_SELECTOR)
+        ) {
+          return element;
+        }
       }
     }
     return null;
